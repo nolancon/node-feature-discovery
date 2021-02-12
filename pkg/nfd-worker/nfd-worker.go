@@ -50,6 +50,7 @@ import (
 	"sigs.k8s.io/node-feature-discovery/source/network"
 	"sigs.k8s.io/node-feature-discovery/source/panic_fake"
 	"sigs.k8s.io/node-feature-discovery/source/pci"
+	"sigs.k8s.io/node-feature-discovery/source/profile"
 	"sigs.k8s.io/node-feature-discovery/source/storage"
 	"sigs.k8s.io/node-feature-discovery/source/system"
 	"sigs.k8s.io/node-feature-discovery/source/usb"
@@ -140,9 +141,12 @@ func NewNfdWorker(args *Args) (NfdWorker, error) {
 			&system.Source{},
 			&usb.Source{},
 			&custom.Source{},
-			// local needs to be the last source so that it is able to override
-			// labels from other sources
+			// local needs to be the last source for feature discovery so that it is
+			// able to override labels from other sources
 			&local.Source{},
+			// profile needs to be the last source because it aggregates all previously
+			// discovered features
+			&profile.Source{},
 		},
 		testSources: []source.FeatureSource{
 			&fake.Source{},
@@ -245,6 +249,9 @@ func (w *nfdWorker) Run() error {
 		case <-labelTrigger:
 			// Get the set of feature labels.
 			labels := createFeatureLabels(w.enabledSources, w.config.Core.LabelWhiteList.Regexp)
+
+			// Add profile labels to list of labels
+			labels = createProfileLabels(w.config.Sources["profile"], labels, w.config.Core.LabelWhiteList.Regexp)
 
 			// Update the node with the feature labels.
 			if w.client != nil {
@@ -509,6 +516,12 @@ func createFeatureLabels(sources []source.FeatureSource, labelWhiteList regexp.R
 
 	// Do feature discovery from all configured sources.
 	for _, source := range sources {
+		switch source.(type) {
+		case *profile.Source:
+			// Skip profile source
+			continue
+		}
+
 		labelsFromSource, err := getFeatureLabels(source, labelWhiteList)
 		if err != nil {
 			klog.Errorf("discovery failed for source %q: %v", source.Name(), err)
@@ -522,6 +535,45 @@ func createFeatureLabels(sources []source.FeatureSource, labelWhiteList regexp.R
 		}
 	}
 	return labels
+}
+
+// createProfileLabels checks the discovered labels against the config profile features and
+// adds overall profile labels where necessary.
+func createProfileLabels(profileCfg source.Config, labels Labels, labelWhiteList regexp.Regexp) Labels {
+	profileObjects, ok := profileCfg.(*profile.Config)
+	if !ok {
+		return labels
+	}
+	for _, profileObject := range *profileObjects {
+		if isSubset(Labels(profileObject.Features), labels) {
+			labelValue := "true"
+			label := getValidLabel("profile-", profileObject.Name, labelValue, labelWhiteList)
+			if label != "" {
+				klog.Infof("INFO: Adding profile label %v=%v to labels", label, labelValue)
+				labels[label] = labelValue
+
+			}
+		}
+	}
+	return labels
+}
+
+// isSubset returns true if all labels in labelsSubset are present in labelsSet.
+func isSubset(labelsSubset, labelsSet Labels) bool {
+	if len(labelsSubset) == 0 {
+		return true
+	}
+
+	for k, v := range labelsSubset {
+		value, ok := labelsSet[k]
+		if !ok {
+			return false
+		}
+		if value != v {
+			return false
+		}
+	}
+	return true
 }
 
 // getFeatureLabels returns node labels for features discovered by the
@@ -548,46 +600,56 @@ func getFeatureLabels(source source.FeatureSource, labelWhiteList regexp.Regexp)
 		prefix = ""
 	}
 
-	for k, v := range features {
-		// Split label name into namespace and name compoents. Use dummy 'ns'
-		// default namespace because there is no function to validate just
-		// the name part
-		split := strings.SplitN(k, "/", 2)
-
-		label := prefix + split[0]
-		nameForValidation := "ns/" + label
-		nameForWhiteListing := label
-
-		if len(split) == 2 {
-			label = k
-			nameForValidation = label
-			nameForWhiteListing = split[1]
-		}
-
-		// Validate label name.
-		errs := validation.IsQualifiedName(nameForValidation)
-		if len(errs) > 0 {
-			klog.Warningf("Ignoring invalid feature name '%s': %s", label, errs)
+	for key, value := range features {
+		labelValue := fmt.Sprintf("%v", value)
+		label := getValidLabel(prefix, key, labelValue, labelWhiteList)
+		if label == "" {
 			continue
 		}
 
-		value := fmt.Sprintf("%v", v)
-		// Validate label value
-		errs = validation.IsValidLabelValue(value)
-		if len(errs) > 0 {
-			klog.Warningf("Ignoring invalid feature value %s=%s: %s", label, value, errs)
-			continue
-		}
-
-		// Skip if label doesn't match labelWhiteList
-		if !labelWhiteList.MatchString(nameForWhiteListing) {
-			klog.Infof("%q does not match the whitelist (%s) and will not be published.", nameForWhiteListing, labelWhiteList.String())
-			continue
-		}
-
-		labels[label] = value
+		labels[label] = labelValue
 	}
 	return labels, nil
+}
+
+// getValidLabel returns a label after checking validity of label name & value and ensuring label
+// exists in whitelist.
+func getValidLabel(prefix, labelKey, labelValue string, labelWhiteList regexp.Regexp) string {
+	// Split label name into namespace and name components. Use dummy 'ns'
+	// default namespace because there is no function to validate just
+	// the name part
+	split := strings.SplitN(labelKey, "/", 2)
+
+	label := prefix + split[0]
+	nameForValidation := "ns/" + label
+	nameForWhiteListing := label
+
+	if len(split) == 2 {
+		label = labelKey
+		nameForValidation = label
+		nameForWhiteListing = split[1]
+	}
+	// Validate label name.
+	errs := validation.IsQualifiedName(nameForValidation)
+	if len(errs) > 0 {
+		klog.Warningf("Ignoring invalid feature name '%s': %s", label, errs)
+		return ""
+	}
+
+	// Validate label value
+	errs = validation.IsValidLabelValue(labelValue)
+	if len(errs) > 0 {
+		klog.Warningf("Ignoring invalid feature value %s=%s: %s", label, labelValue, errs)
+		return ""
+	}
+
+	// Skip if label doesn't match labelWhiteList
+	if !labelWhiteList.MatchString(nameForWhiteListing) {
+		klog.Warningf("%q does not match the whitelist (%s) and will not be published.", nameForWhiteListing, labelWhiteList.String())
+		return ""
+	}
+	return label
+
 }
 
 // advertiseFeatureLabels advertises the feature labels to a Kubernetes node
